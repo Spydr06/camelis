@@ -416,7 +416,9 @@ let basis =
         numprim "/" (/);
         numprim "mod" (mod);
         cmpprim "<" (<);
+        cmpprim "<=" (<=);
         cmpprim ">" (>);
+        cmpprim ">=" (>=);
         cmpprim "=" (=);
         ("pair", prim_pair);
         ("list", prim_list);
