@@ -1,0 +1,4 @@
+*.out
+*.cmi
+*.cmo
+.vscode/
