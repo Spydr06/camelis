@@ -1,12 +1,18 @@
-type stream = {
+
+type 'a stream = {
     mutable line_num : int;
     mutable chr : char list;
-    chan : in_channel;
+    is_stdin: bool;
+    stm : 'a Stream.t;
 }
+
+let mkstream is_stdin stm = { chr = []; line_num = 1; is_stdin = is_stdin; stm = stm; }
+let mkstringstream s = mkstream false @@ Stream.of_string s
+let mkfilestream f = mkstream (f = stdin) @@ Stream.of_channel f
 
 let read_char stm =
     match stm.chr with
-    | [] -> let c = input_char stm.chan in
+    | [] -> let c = Stream.next stm.stm in
         if c = '\n' 
         then let _ = stm.line_num <- stm.line_num + 1 in c
         else c
@@ -165,7 +171,7 @@ let rec build_ast sexp =
                                  (pair_to_list ns) 
             in
             Lambda (names, build_ast e)
-        | [Symbol "defun"; Symbol n; ns; e] ->
+        | [Symbol "define"; Symbol n; ns; e] ->
             let err () = raise (TypeError "(define name (formals) body)") in
             let names = List.map (function Symbol s -> s | _ -> err ())
                                  (pair_to_list ns) 
@@ -185,6 +191,58 @@ let rec build_ast sexp =
         | [] -> raise (ParseError "poorly formed expression")
     )
     | Pair _ -> Literal sexp
+
+let spacesep ns = String.concat " " ns
+
+let rec string_of_exp =
+    let spacesep_exp es = spacesep (List.map string_of_exp es) in
+    let string_of_binding (n, e) = "(" ^ n ^ " " ^ (string_of_exp e) ^ ")" in
+    function
+    | Literal e -> string_of_val e
+    | Var n -> n
+    | If (c, t, f) ->
+        "(if " ^ string_of_exp c ^ " " ^ string_of_exp t ^ " " ^ string_of_exp f ^ ")"
+    | And (c0, c1) -> "(and " ^ string_of_exp c0 ^ " " ^ string_of_exp c1 ^ ")"
+    | Or (c0, c1) -> "(or " ^ string_of_exp c0 ^ " " ^ string_of_exp c1 ^ ")"
+    | Apply (f, e) -> "(apply " ^ string_of_exp f ^ " " ^ string_of_exp e ^ ")"
+    | Call (f, es) -> "(" ^ string_of_exp f ^ " " ^ spacesep_exp es ^ ")"
+    | Lambda (ns, e) ->  "(lambda (" ^ spacesep ns ^ ") " ^ string_of_exp e ^ ")"
+    | Let (kind, bs, e) ->
+        let str = match kind with
+                  | LET -> "let"
+                  | LETSTAR -> "let*"
+                  | LETREC -> "letrec"
+        in
+        let bindings = spacesep (List.map string_of_binding bs) in
+        "(" ^ str ^ " (" ^ bindings ^ ") " ^ string_of_exp e ^ ")"
+    | Defexp (Val (n, e)) -> "(val " ^ n ^ " " ^ string_of_exp e ^ ")"
+    | Defexp (Def (n, ns, e)) ->
+        "(define " ^ n ^ "(" ^ spacesep ns ^ ") " ^ string_of_exp e ^ ")"
+    | Defexp (Exp e) -> string_of_exp e
+
+and string_of_val e =
+    match e with
+    | Fixnum(v) -> string_of_int v
+    | Boolean(true) -> "#t"
+    | Boolean(false) -> "#f"
+    | Symbol(s) -> s
+    | Closure(name, _, _) -> "#<closure>"
+    | Primitive(name, _) ->  "#<primitive:" ^ name ^ ">"
+    | Quote(v) -> "'" ^ string_of_val v
+    | Nil -> "nil"
+    | Pair(a, b) ->
+        let rec string_of_list l =
+            match l with
+            | Pair(a, Nil) -> string_of_val a;
+            | Pair(a, b) -> string_of_val a ^ " " ^ string_of_val b;
+            | _ -> raise Unreachable
+        in
+        let string_of_pair p =
+            match p with
+            | Pair(a, b) -> string_of_val a ^ " . " ^ string_of_val b;
+            | _ -> raise Unreachable
+        in
+        "(" ^ (if is_list e then string_of_list e else string_of_pair e) ^ ")"
 
 let rec env_to_val =
     let b_to_val (n, vor) = Pair (Symbol n, (match !vor with
@@ -253,14 +311,20 @@ let rec eval_exp exp env =
             eval_exp body (extend (List.map evbinding bs) env)
         | Let (LETSTAR, bs, body) -> 
             let evbinding acc (n, e) = bind (n, eval_exp e acc, acc) in
-            eval_exp body (extend (List.fold_left evbinding [] bs) env)
+            eval_exp body (List.fold_left evbinding env bs)
         | Let (LETREC, bs, body) ->
             let names, values = unzip bs in
             let env' = bindloclist names (List.map mkloc values) env in
             let updates = List.map (fun (n, e) -> n, Some (eval_exp e env')) bs in
             let () = List.iter (fun (n, v) -> (List.assoc n env') := v) updates in
             eval_exp body env'
-    in ev exp
+    in 
+    try ev exp
+    with e -> (
+        let err = Printexc.to_string e in
+        print_endline @@ "Error: '" ^ err ^ "' in expression " ^ string_of_exp exp;
+        raise e
+    )
 
 let eval_def def env =
     match def with
@@ -282,45 +346,6 @@ let rec eval ast env =
     match ast with
     | Defexp d -> eval_def d env
     | e -> (eval_exp e env, env)
-
-(*let rec string_of_exp = function
-    | Literal e -> string_of_val e
-    | Var n -> n
-    | If (c, t, f) ->
-        "(if " ^ string_of_exp c ^ " " ^ string_of_exp t ^ " " ^ string_of_exp f ^ ")"
-    | And (c0, c1) -> "(and " ^ string_of_exp c0 ^ " " ^ string_of_exp c1 ^ ")"
-    | Or (c0, c1) -> "(or " ^ string_of_exp c0 ^ " " ^ string_of_exp c1 ^ ")"
-    | Apply (f, e) -> "(apply " ^ string_of_exp f ^ " " ^ string_of_exp e ^ ")"
-    | Call (f, es) ->
-        let string_es = (String.concat " " (List.map string_of_exp es)) in
-        "(" ^ string_of_exp f ^ " " ^ string_es ^ ")"
-    | Defexp (Val (n, e)) -> "(val " ^ n ^ " " ^ string_of_exp e ^ ")"
-    | Defexp (Exp e) -> string_of_exp e
-    | Lambda*)
-
-and string_of_val e =
-    match e with
-    | Fixnum(v) -> string_of_int v
-    | Boolean(true) -> "#t"
-    | Boolean(false) -> "#f"
-    | Symbol(s) -> s
-    | Closure(name, _, _) -> "#<closure>"
-    | Primitive(name, _) ->  "#<primitive:" ^ name ^ ">"
-    | Quote(v) -> "'" ^ string_of_val v
-    | Nil -> "nil"
-    | Pair(a, b) ->
-        let rec string_of_list l =
-            match l with
-            | Pair(a, Nil) -> string_of_val a;
-            | Pair(a, b) -> string_of_val a ^ " " ^ string_of_val b;
-            | _ -> raise Unreachable
-        in
-        let string_of_pair p =
-            match p with
-            | Pair(a, b) -> string_of_val a ^ " . " ^ string_of_val b;
-            | _ -> raise Unreachable
-        in
-        "(" ^ (if is_list e then string_of_list e else string_of_pair e) ^ ")"
 
 let basis =
     let numprim name op = 
@@ -406,11 +431,25 @@ let basis =
         ("exit", prim_exit);
     ]
 
+let stdlib =
+    let ev env e =
+        match e with
+        | Defexp d -> eval_def d env
+        | _ -> raise (TypeError "Can only have definitions in stdlib")
+    in
+    let rec slurp stm env =
+        try stm |> read_sexp |> build_ast |> ev env |> snd |> slurp stm
+        with Stream.Failure -> env
+    in
+    let stm = mkstringstream Std.std_string
+    in
+    slurp stm basis
+
 let rec repl stm env = 
-    if stm.chan = stdin then (print_string "> "; flush stdout; );
+    if stm.is_stdin then (print_string "> "; flush stdout);
     let ast = build_ast @@ read_sexp stm in
     let (result, env') = eval ast env in
-    if stm.chan = stdin then print_endline @@ string_of_val result;
+    if stm.is_stdin then print_endline @@ string_of_val result;
     repl stm env'    
 
 let get_ic () =
@@ -421,8 +460,7 @@ let main =
     if (Array.length Sys.argv) <= 2
     then
         let ic = get_ic () in
-        let stm = { chr = []; line_num = 1; chan = ic } in
-        try repl stm basis
+        try repl (mkfilestream ic) stdlib
         with End_of_file -> if ic <> stdin then close_in ic
     else (
         print_endline @@ "Usage: " ^ Sys.argv.(0) ^ " <file>";
