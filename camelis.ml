@@ -34,6 +34,7 @@ type lobject =
     | Nil
     | Pair of lobject * lobject
     | Primitive of string * (lobject list -> lobject)
+    | Quote of value
 
 and value = lobject
 and name = string
@@ -107,9 +108,10 @@ let rec read_sexp stm =
     let c = read_char stm in
         if is_symstartchar c
         then Symbol(string_of_char c ^ read_symbol ())
+        else if c = '\'' then Quote (read_sexp stm)
         else if c = '(' then read_list stm
         else if (is_digit c) || (c = '~') then read_fixnum (Char.escaped (if c = '~' then '-' else c))
-        else if c == '#' then
+        else if c = '#' then
             match (read_char stm) with
             | 't' -> Boolean(true)
             | 'f' -> Boolean(false)
@@ -119,7 +121,7 @@ let rec read_sexp stm =
 let rec build_ast sexp =
     match sexp with
     | Primitive _ -> raise Unreachable
-    | Fixnum _ | Boolean _ | Nil -> Literal sexp
+    | Fixnum _ | Boolean _ | Quote _ | Nil -> Literal sexp
     | Symbol s -> Var s
     | Pair _ when is_list sexp -> (
         match pair_to_list sexp with
@@ -127,6 +129,7 @@ let rec build_ast sexp =
             If (build_ast cond, build_ast iftrue, build_ast iffalse)
         | [Symbol "and"; c1; c2] -> And (build_ast c1, build_ast c2)
         | [Symbol "or"; c1; c2] -> Or (build_ast c1, build_ast c2)
+        | [Symbol "quote"; e] -> Literal (Quote e)
         | [Symbol "val"; Symbol n; e] -> Defexp (Val (n, build_ast e))
         | [Symbol "apply"; fnexp; args] when is_list args ->
             Apply (build_ast fnexp, build_ast args)
@@ -150,6 +153,7 @@ let rec eval_exp exp env =
         | _ -> raise (TypeError "(apply prim '(args)) or (prim args)")
     in
     let rec ev = function
+        | Literal Quote e -> e
         | Literal l -> l
         | Var n -> lookup (n, env)
         | If (c, t, f) when ev c = Boolean true -> ev t
@@ -183,13 +187,28 @@ let rec eval ast env =
     | Defexp d -> eval_def d env
     | e -> (eval_exp e env, env)
 
-let rec string_of_val e =
+let rec string_of_exp = function
+    | Literal e -> string_of_val e
+    | Var n -> n
+    | If (c, t, f) ->
+        "(if " ^ string_of_exp c ^ " " ^ string_of_exp t ^ " " ^ string_of_exp f ^ ")"
+    | And (c0, c1) -> "(and " ^ string_of_exp c0 ^ " " ^ string_of_exp c1 ^ ")"
+    | Or (c0, c1) -> "(or " ^ string_of_exp c0 ^ " " ^ string_of_exp c1 ^ ")"
+    | Apply (f, e) -> "(apply " ^ string_of_exp f ^ " " ^ string_of_exp e ^ ")"
+    | Call (f, es) ->
+        let string_es = (String.concat " " (List.map string_of_exp es)) in
+        "(" ^ string_of_exp f ^ " " ^ string_es ^ ")"
+    | Defexp (Val (n, e)) -> "(val " ^ n ^ " " ^ string_of_exp e ^ ")"
+    | Defexp (Exp e) -> string_of_exp e
+
+and string_of_val e =
     match e with
     | Fixnum(v) -> string_of_int v
     | Boolean(true) -> "#t"
     | Boolean(false) -> "#f"
     | Symbol(s) -> s
     | Primitive(name, _) ->  "#<primitive:" ^ name ^ ">"
+    | Quote(v) -> "'" ^ string_of_val v
     | Nil -> "nil"
     | Pair(a, b) ->
         let rec string_of_list l =
