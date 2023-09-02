@@ -117,10 +117,13 @@ let rec read_sexp stm =
             let cdr = read_list stm in
             Pair(car, cdr)
     in
+    let rec eat_comment stm =
+        if (read_char stm) = '\n' then () else eat_comment stm
+    in
     eat_whitespace stm;
     let c = read_char stm in
-        if is_symstartchar c
-        then Symbol(string_of_char c ^ read_symbol ())
+        if c = ';' then (eat_comment stm; read_sexp stm)
+        else if is_symstartchar c then Symbol(string_of_char c ^ read_symbol ())
         else if c = '\'' then Quote (read_sexp stm)
         else if c = '(' then read_list stm
         else if (is_digit c) || (c = '~') then read_fixnum (Char.escaped (if c = '~' then '-' else c))
@@ -358,16 +361,30 @@ let basis =
         | [Fixnum(code)] -> exit code
         | _ -> raise (TypeError "(exit) or (exit int)")
     in
-    let prim_putln values =
-        let print_val v = print_string (string_of_val v ^ " ") in
-        ignore (List.map print_val values);
+    let prim_getchar = function
+        | [] -> 
+            (try Fixnum (int_of_char @@ input_char stdin)
+            with End_of_file -> Fixnum (-1))
+        | _ -> raise (TypeError "(getchar)")
+    in
+    let prim_print values =
+        let print_val v = print_string @@ string_of_val v ^ " " in
+        List.iter print_val values;
         print_newline ();
-        Nil
+        Symbol "ok"
+    in
+    let prim_itoc = function
+        | [Fixnum i] -> Symbol (string_of_char @@ char_of_int i)
+        | _ -> raise (TypeError "(itoc int)")
+    in
+    let prim_cat = function
+        | [Symbol a; Symbol b] -> Symbol (a ^ b)
+        | _ -> raise (TypeError "(cat sym sym)")
     in
     let newprim acc (name, func) =
         bind (name, Primitive(name, func), acc)
     in
-    List.fold_left newprim [] [
+    List.fold_left newprim ["empty-symbol", ref (Some (Symbol ""))] [
         numprim "+" (+);
         numprim "-" (-);
         numprim "*" ( * );
@@ -382,25 +399,32 @@ let basis =
         ("cdr", prim_cdr);
         ("eq", prim_eq);
         ("atom?", prim_atomp);
+        ("getchar", prim_getchar);
+        ("print", prim_print);
+        ("itoc", prim_itoc);
+        ("cat", prim_cat);
         ("exit", prim_exit);
-        ("putln", prim_putln);
     ]
 
 let rec repl stm env = 
-    print_string "> ";
-    flush stdout;
-    let ast = build_ast (read_sexp stm) in
+    if stm.chan = stdin then (print_string "> "; flush stdout; );
+    let ast = build_ast @@ read_sexp stm in
     let (result, env') = eval ast env in
-    let () = print_endline (string_of_val result) in
-        repl stm env'    
+    if stm.chan = stdin then print_endline @@ string_of_val result;
+    repl stm env'    
+
+let get_ic () =
+    try open_in Sys.argv.(1)
+    with Invalid_argument s -> stdin
 
 let main =
-    match Array.length Sys.argv with
-    | 1 -> let stm = { chr = []; line_num = 1; chan = stdin } in
-        repl stm basis
-    | 2 -> let istm = open_in Sys.argv.(1) in
-        let _ = eval (build_ast (read_sexp { chr = []; line_num = 1; chan = istm })) basis in
-        close_in istm
-    | _ -> 
-        print_endline ("Usage: " ^ Sys.argv.(0) ^ " <file>");
+    if (Array.length Sys.argv) <= 2
+    then
+        let ic = get_ic () in
+        let stm = { chr = []; line_num = 1; chan = ic } in
+        try repl stm basis
+        with End_of_file -> if ic <> stdin then close_in ic
+    else (
+        print_endline @@ "Usage: " ^ Sys.argv.(0) ^ " <file>";
         exit 1
+    )
