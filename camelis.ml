@@ -26,6 +26,14 @@ exception SyntaxError of string
 exception TypeError of string
 exception ParseError of string
 exception NotFound of string
+exception UnspecifiedValue of string
+exception UniqueError of string
+
+let rec assert_unique = function
+    | [] -> ()
+    | x :: xs -> if List.mem x xs then raise (UniqueError x) else assert_unique xs
+
+type 'a env = (string * 'a option ref) list
 
 type lobject = 
     | Fixnum of int
@@ -35,9 +43,11 @@ type lobject =
     | Pair of lobject * lobject
     | Primitive of string * (lobject list -> lobject)
     | Quote of value
+    | Closure of name list * exp * value env
 
 and value = lobject
 and name = string
+and let_kind = LET | LETSTAR | LETREC
 
 and exp =
     | Literal of value
@@ -48,9 +58,12 @@ and exp =
     | Apply of exp * exp
     | Call of exp * exp list
     | Defexp of def
+    | Lambda of name list * exp
+    | Let of let_kind * (name * exp) list * exp
 
 and def =
     | Val of name * exp
+    | Def of name * name list * exp
     | Exp of exp
 
 let rec is_list e =
@@ -119,39 +132,95 @@ let rec read_sexp stm =
         else raise (SyntaxError ("Unexpected char `" ^ Char.escaped c ^ "`"))
 
 let rec build_ast sexp =
+    let rec cond_to_if = function
+        | [] -> Literal (Symbol "error")
+        | (Pair(cond, Pair(res, Nil))) :: condpairs ->
+            If (build_ast cond, build_ast res, cond_to_if condpairs)
+        | _ -> raise (TypeError "(cond conditions)")
+    in
+    
+    let let_kinds = ["let", LET; "let*", LETSTAR; "letrec", LETREC] in
+    let valid_let s = List.mem_assoc s let_kinds in
+    let to_kind s = List.assoc s let_kinds in
+
     match sexp with
-    | Primitive _ -> raise Unreachable
+    | Primitive _ | Closure _ -> raise Unreachable
     | Fixnum _ | Boolean _ | Quote _ | Nil -> Literal sexp
     | Symbol s -> Var s
     | Pair _ when is_list sexp -> (
         match pair_to_list sexp with
         | [Symbol "if"; cond; iftrue; iffalse] ->
             If (build_ast cond, build_ast iftrue, build_ast iffalse)
+        | (Symbol "cond") :: conditions -> cond_to_if conditions
         | [Symbol "and"; c1; c2] -> And (build_ast c1, build_ast c2)
         | [Symbol "or"; c1; c2] -> Or (build_ast c1, build_ast c2)
         | [Symbol "quote"; e] -> Literal (Quote e)
         | [Symbol "val"; Symbol n; e] -> Defexp (Val (n, build_ast e))
+        | [Symbol "lambda"; ns; e] when is_list ns ->
+            let err () = raise (TypeError "(lambda (formals) body)") in
+            let names = List.map (function Symbol s -> s | _ -> err ())
+                                 (pair_to_list ns) 
+            in
+            Lambda (names, build_ast e)
+        | [Symbol "defun"; Symbol n; ns; e] ->
+            let err () = raise (TypeError "(define name (formals) body)") in
+            let names = List.map (function Symbol s -> s | _ -> err ())
+                                 (pair_to_list ns) 
+            in
+            Defexp (Def (n, names, build_ast e))
         | [Symbol "apply"; fnexp; args] when is_list args ->
             Apply (build_ast fnexp, build_ast args)
+        | (Symbol s) :: bindings :: exp :: [] when is_list bindings && valid_let s -> 
+            let mkbinding = function
+                | Pair (Symbol n, Pair (e, Nil)) -> n, build_ast e
+                | _ -> raise (TypeError "(let bindings exp)")
+            in
+            let bindings = List.map mkbinding (pair_to_list bindings) in
+            let () = assert_unique (List.map fst bindings) in
+            Let (to_kind s, bindings, build_ast exp)
         | fnexp::args -> Call (build_ast fnexp, List.map build_ast args)
         | [] -> raise (ParseError "poorly formed expression")
     )
     | Pair _ -> Literal sexp
 
-let rec lookup (n, e) =
-    match e with
-    | Nil -> raise (NotFound n)
-    | Pair(Pair(Symbol n', v), rst) -> if n = n' then v else lookup (n, rst)
-    | _ -> raise Unreachable
+let rec env_to_val =
+    let b_to_val (n, vor) = Pair (Symbol n, (match !vor with
+        | None -> Symbol "unspecified"
+        | Some v -> v))
+    in function
+    | [] -> Nil
+    | b :: bs -> Pair(b_to_val b, env_to_val bs)
 
-let rec bind (n, v, e) = Pair(Pair(Symbol n, v), e)
+(*val bindloc : name * 'a option ref * a env -> 'a env*)
+let bindloc (n, vor, e) = (n, vor) :: e
+let mkloc _ = ref None
+
+let rec bind (n, v, e) = (n, ref (Some v)) :: e
+let bindlist ns vs env = List.fold_left2 (fun acc n v -> bind (n, v, acc)) env ns vs
+    
+let bindloclist ns vs env = List.fold_left2 (fun acc n v -> bindloc (n, v, acc)) env ns vs
+
+let extend newenv oldenv =
+    List.fold_right (fun (b, v) acc -> bindloc (b, v, acc)) newenv oldenv
+
+let rec lookup = function
+    | (n, []) -> raise (NotFound n)
+    | (n, (n', v) :: _) when n = n' ->
+        begin
+            match !v with
+            | Some v' -> v'
+            | None -> raise (UnspecifiedValue n)
+        end
+    | (n, (n', _) :: bs) -> lookup (n, bs)
 
 let rec eval_exp exp env =
-    let eval_apply f es =
+    let eval_apply f vs =
         match f with
-        | Primitive (_, f) -> f es
+        | Primitive (_, f) -> f vs
+        | Closure (ns, e, clenv) -> eval_exp e (bindlist ns vs clenv)
         | _ -> raise (TypeError "(apply prim '(args)) or (prim args)")
     in
+    let rec unzip ls = (List.map fst ls, List.map snd ls) in
     let rec ev = function
         | Literal Quote e -> e
         | Literal l -> l
@@ -172,14 +241,38 @@ let rec eval_exp exp env =
                 | _ -> raise (TypeError "(or bool bool)")
             end
         | Apply (fn, e) -> eval_apply (ev fn) (pair_to_list (ev e))
-        | Call (Var "env", []) -> env
+        | Call (Var "env", []) -> env_to_val env
         | Call (e, es) -> eval_apply (ev e) (List.map ev es)
+        | Lambda (ns, e) -> Closure (ns, e, env)
         | Defexp d -> raise Unreachable
+        | Let (LET, bs, body) ->
+            let evbinding (n, e) = n, ref (Some (ev e)) in
+            eval_exp body (extend (List.map evbinding bs) env)
+        | Let (LETSTAR, bs, body) -> 
+            let evbinding acc (n, e) = bind (n, eval_exp e acc, acc) in
+            eval_exp body (extend (List.fold_left evbinding [] bs) env)
+        | Let (LETREC, bs, body) ->
+            let names, values = unzip bs in
+            let env' = bindloclist names (List.map mkloc values) env in
+            let updates = List.map (fun (n, e) -> n, Some (eval_exp e env')) bs in
+            let () = List.iter (fun (n, v) -> (List.assoc n env') := v) updates in
+            eval_exp body env'
     in ev exp
 
 let eval_def def env =
     match def with
     | Val (n, e) -> let v = eval_exp e env in (v, bind (n, v, env))
+    | Def (n, ns, e) ->
+        let (formals, body, clenv) = (
+            match eval_exp (Lambda (ns, e)) env with
+            | Closure (fs, bod, env) -> (fs, bod, env)
+            | _ -> raise (TypeError "Expecting closure.")
+        )
+        in
+        let loc = mkloc () in
+        let clo = Closure (formals, body, bindloc (n, loc, clenv)) in
+        let () = loc := Some clo in
+        (clo, bindloc (n, loc, env))
     | Exp e -> (eval_exp e env, env)
 
 let rec eval ast env =
@@ -187,7 +280,7 @@ let rec eval ast env =
     | Defexp d -> eval_def d env
     | e -> (eval_exp e env, env)
 
-let rec string_of_exp = function
+(*let rec string_of_exp = function
     | Literal e -> string_of_val e
     | Var n -> n
     | If (c, t, f) ->
@@ -200,6 +293,7 @@ let rec string_of_exp = function
         "(" ^ string_of_exp f ^ " " ^ string_es ^ ")"
     | Defexp (Val (n, e)) -> "(val " ^ n ^ " " ^ string_of_exp e ^ ")"
     | Defexp (Exp e) -> string_of_exp e
+    | Lambda*)
 
 and string_of_val e =
     match e with
@@ -207,6 +301,7 @@ and string_of_val e =
     | Boolean(true) -> "#t"
     | Boolean(false) -> "#f"
     | Symbol(s) -> s
+    | Closure(name, _, _) -> "#<closure>"
     | Primitive(name, _) ->  "#<primitive:" ^ name ^ ">"
     | Quote(v) -> "'" ^ string_of_val v
     | Nil -> "nil"
@@ -225,9 +320,13 @@ and string_of_val e =
         "(" ^ (if is_list e then string_of_list e else string_of_pair e) ^ ")"
 
 let basis =
-    let prim_plus = function
-        | [Fixnum(a); Fixnum(b)] -> Fixnum(a + b)
-        | _ -> raise (TypeError "(+ int int)")
+    let numprim name op = 
+        (name, (function [Fixnum a; Fixnum b] -> Fixnum (op a b)
+                | _ -> raise (TypeError ("(" ^ name ^ " int int)"))))
+    in
+    let cmpprim name op =
+        (name, (function [Fixnum a; Fixnum b] -> Boolean (op a b)
+                | _ -> raise (TypeError ("(" ^ name ^ " int int)"))))
     in
     let prim_pair = function
         | [a; b] -> Pair(a, b)
@@ -237,19 +336,54 @@ let basis =
         | [] -> Nil
         | car::cdr -> Pair(car, prim_list cdr)
     in
+    let prim_car = function
+        | [Pair (car, _)] -> car
+        | _ -> raise (TypeError "(car non-nil-pair")
+    in
+    let prim_cdr = function
+        | [Pair (_, cdr)] -> cdr
+        | _ -> raise (TypeError "(car non-nil-pair")
+    in
+    let prim_atomp = function
+        | [Pair (_, _)] -> Boolean false
+        | [_] -> Boolean true
+        | _ -> raise (TypeError "(atom? something)")
+    in
+    let prim_eq = function
+        | [a; b] -> Boolean (a = b)
+        | _ -> raise (TypeError "(eq a b)")
+    in
     let prim_exit = function
         | [] -> exit 0
         | [Fixnum(code)] -> exit code
         | _ -> raise (TypeError "(exit) or (exit int)")
     in
+    let prim_putln values =
+        let print_val v = print_string (string_of_val v ^ " ") in
+        ignore (List.map print_val values);
+        print_newline ();
+        Nil
+    in
     let newprim acc (name, func) =
         bind (name, Primitive(name, func), acc)
     in
-    List.fold_left newprim Nil [
-        ("+", prim_plus);
+    List.fold_left newprim [] [
+        numprim "+" (+);
+        numprim "-" (-);
+        numprim "*" ( * );
+        numprim "/" (/);
+        numprim "mod" (mod);
+        cmpprim "<" (<);
+        cmpprim ">" (>);
+        cmpprim "=" (=);
         ("pair", prim_pair);
         ("list", prim_list);
+        ("car", prim_car);
+        ("cdr", prim_cdr);
+        ("eq", prim_eq);
+        ("atom?", prim_atomp);
         ("exit", prim_exit);
+        ("putln", prim_putln);
     ]
 
 let rec repl stm env = 
@@ -258,8 +392,15 @@ let rec repl stm env =
     let ast = build_ast (read_sexp stm) in
     let (result, env') = eval ast env in
     let () = print_endline (string_of_val result) in
-        repl stm env'
+        repl stm env'    
 
 let main =
-    let stm = { chr = []; line_num = 1; chan = stdin } in
+    match Array.length Sys.argv with
+    | 1 -> let stm = { chr = []; line_num = 1; chan = stdin } in
         repl stm basis
+    | 2 -> let istm = open_in Sys.argv.(1) in
+        let _ = eval (build_ast (read_sexp { chr = []; line_num = 1; chan = istm })) basis in
+        close_in istm
+    | _ -> 
+        print_endline ("Usage: " ^ Sys.argv.(0) ^ " <file>");
+        exit 1
